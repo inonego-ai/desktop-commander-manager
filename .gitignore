@@ -1,0 +1,29 @@
+# Credentials and per-user files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+**/credentials/
+**/profiles/
+**/state/
+**/settings.json
+**/access-policy.json
+**/restart-request.txt
+**/commander-manager.yaml
+
+# Runtime/build artifacts
+node_modules/
+manager/node_modules/
+manager/dist/
+manager/src-tauri/target/
+manager/src-tauri/gen/
+manager/src-tauri/resources/runtime/**
+!manager/src-tauri/resources/runtime/.gitkeep
+manager/src-tauri/resources/proxy/MCPStdioProxy.mjs
+.tmp/
+coverage/
+*.log

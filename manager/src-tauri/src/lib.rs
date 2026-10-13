@@ -1,0 +1,364 @@
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::Mutex,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, State, WindowEvent,
+};
+
+const KEY_SERVICE: &str = "ai.inonego.commander-manager.control-plane";
+const KEY_ACCOUNT: &str = "current-user";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    tunnel_id: String,
+    restricted: bool,
+    allowed_folders: Vec<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { tunnel_id: String::new(), restricted: true, allowed_folders: Vec::new() }
+    }
+}
+
+#[derive(Serialize)]
+struct Status {
+    running: bool,
+    ready: bool,
+    restricted: bool,
+    allowed_folders: Vec<String>,
+    tunnel_id: String,
+    has_key: bool,
+    runtime_ready: bool,
+    runtime_message: String,
+}
+
+struct CommanderState {
+    config: Mutex<Settings>,
+    process: Mutex<Option<Child>>,
+    data_dir: PathBuf,
+    resource_dir: PathBuf,
+}
+
+impl CommanderState {
+    fn settings_path(&self) -> PathBuf { self.data_dir.join("settings.json") }
+    // One atomic, non-secret JSON file is both the UI settings and MCP policy.
+    // Keeping one source of truth prevents a half-written mode transition.
+    fn policy_path(&self) -> PathBuf { self.settings_path() }
+    fn restart_trigger(&self) -> PathBuf { self.data_dir.join("restart-request.txt") }
+
+    fn save_config(&self, config: &Settings) -> Result<(), String> {
+        let serialized = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
+        let pending = self.settings_path().with_extension("tmp");
+        fs::write(&pending, serialized).map_err(|e| e.to_string())?;
+        fs::rename(pending, self.settings_path()).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn signal_restart(&self) -> Result<(), String> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?.as_nanos();
+        fs::write(self.restart_trigger(), timestamp.to_string()).map_err(|e| e.to_string())
+    }
+
+    fn runtime_files(&self) -> (PathBuf, PathBuf, PathBuf, PathBuf, PathBuf) {
+        let runtime = self.resource_dir.join("runtime");
+        (
+            runtime.join("tunnel-client.exe"),
+            runtime.join("node.exe"),
+            runtime.join("node_modules").join("@wonderwhy-er").join("desktop-commander").join("dist").join("index.js"),
+            self.resource_dir.join("proxy").join("MCPStdioProxy.mjs"),
+            self.resource_dir.join("proxy").join("PolicyProxy.mjs"),
+        )
+    }
+
+    fn runtime_check(&self) -> Result<(), String> {
+        let (tunnel, node, dc, transport, guard) = self.runtime_files();
+        let missing: Vec<_> = [tunnel, node, dc, transport, guard].into_iter()
+            .filter(|p| !p.is_file()).map(|p| p.display().to_string()).collect();
+        if missing.is_empty() { Ok(()) }
+        else { Err(format!("Release runtime is incomplete ({} missing file(s)). Run scripts/Prepare-Release.ps1 before building.", missing.len())) }
+    }
+
+    // Health check is strictly bound to a local ephemeral loopback address.
+    // A running process alone does not establish tunnel readiness.
+    fn is_ready(&self) -> bool {
+        let health_file = self.data_dir.join("logs").join("health.url");
+        let Ok(url) = fs::read_to_string(health_file) else { return false; };
+        let Some(host_port) = url.trim().strip_prefix("http://127.0.0.1:") else { return false; };
+        let Ok(port) = host_port.split('/').next().unwrap_or("").parse::<u16>() else { return false; };
+        if port == 0 { return false; }
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let Ok(mut socket) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else { return false; };
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(300)));
+        let _ = socket.set_write_timeout(Some(Duration::from_millis(300)));
+        if socket.write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").is_err() { return false; }
+        let mut response = [0; 64];
+        matches!(socket.read(&mut response), Ok(size) if
+            response[..size].starts_with(b"HTTP/1.1 200 ") || response[..size].starts_with(b"HTTP/1.0 200 "))
+    }
+
+    fn is_running(&self) -> Result<bool, String> {
+        let mut child = self.process.lock().map_err(|e| e.to_string())?;
+        if let Some(process) = child.as_mut() {
+            match process.try_wait() {
+                Ok(None) => Ok(true),
+                Ok(Some(_)) => { *child = None; Ok(false) },
+                Err(e) => Err(e.to_string()),
+            }
+        } else { Ok(false) }
+    }
+
+    fn stop(&self) -> Result<(), String> {
+        let mut managed = self.process.lock().map_err(|e| e.to_string())?;
+        let Some(child) = managed.as_mut() else { return Ok(()); };
+        // Only the process tree this manager created may be stopped. Never
+        // terminate all node.exe or tunnel-client.exe processes on the PC.
+        #[cfg(target_os = "windows")]
+        {
+            let status = Command::new("taskkill.exe")
+                .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .stdout(Stdio::null()).stderr(Stdio::null())
+                .status().map_err(|e| format!("Cannot stop managed tunnel tree: {e}"))?;
+            if !status.success() {
+                return Err("Stopping the managed tunnel process tree failed. It is still tracked; check its status before retrying.".into());
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        { child.kill().map_err(|e| e.to_string())?; }
+        child.wait().map_err(|e| e.to_string())?;
+        *managed = None;
+        Ok(())
+    }
+
+}
+
+fn secret_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT).map_err(|e| e.to_string())
+}
+
+fn secret_is_set() -> bool {
+    secret_entry().and_then(|e| e.get_password().map_err(|e| e.to_string()))
+        .is_ok_and(|value| !value.is_empty())
+}
+
+fn validate_tunnel_id(value: &str) -> Result<(), String> {
+    if !value.starts_with("tunnel_") || value.len() > 180
+        || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return Err("Invalid tunnel ID. Expected tunnel_ followed by letters, digits, or underscores.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_status(manager: State<'_, CommanderState>) -> Result<Status, String> {
+    let running = manager.is_running()?;
+    let config = manager.config.lock().map_err(|e| e.to_string())?.clone();
+    let runtime = manager.runtime_check();
+    Ok(Status {
+        running, ready: running && manager.is_ready(), restricted: config.restricted,
+        allowed_folders: config.allowed_folders,
+        tunnel_id: config.tunnel_id,
+        has_key: secret_is_set(),
+        runtime_ready: runtime.is_ok(),
+        runtime_message: runtime.err().unwrap_or_default(),
+    })
+}
+
+#[tauri::command]
+fn save_connection(manager: State<'_, CommanderState>, tunnel_id: String, api_key: String) -> Result<(), String> {
+    let id = tunnel_id.trim();
+    validate_tunnel_id(id)?;
+    if manager.is_running()? { return Err("Disconnect the tunnel before changing credentials.".into()); }
+    if !api_key.is_empty() && (api_key.trim().is_empty() || (api_key.contains('\r') || api_key.contains('\n'))) {
+        return Err("API key must be nonblank and single-line.".into());
+    }
+    let mut config = manager.config.lock().map_err(|e| e.to_string())?;
+    let mut proposed = config.clone();
+    proposed.tunnel_id = id.to_string();
+    // Do not expose credential bytes in any settings or policy file.
+    manager.save_config(&proposed)?;
+    if !api_key.is_empty() {
+        secret_entry()?.set_password(&api_key).map_err(|e| format!("Credential Manager error: {e}"))?;
+    }
+    *config = proposed;
+    Ok(())
+}
+
+#[tauri::command]
+fn set_restricted(manager: State<'_, CommanderState>, restricted: bool) -> Result<(), String> {
+    let mut config = manager.config.lock().map_err(|e| e.to_string())?;
+    let mut proposed = config.clone();
+    proposed.restricted = restricted;
+    manager.save_config(&proposed)?;
+    *config = proposed;
+    // Switching from unrestricted to restricted invalidates old command
+    // sessions. PolicyProxy exits on signal, so MCPStdioProxy respawns it.
+    if restricted && manager.is_running()? { manager.signal_restart()?; }
+    Ok(())
+}
+
+#[tauri::command]
+fn add_folder(manager: State<'_, CommanderState>, path: String) -> Result<(), String> {
+    let resolved = fs::canonicalize(Path::new(&path))
+        .map_err(|e| format!("Could not open folder: {e}"))?;
+    if !resolved.is_dir() { return Err("Selected path is not a folder.".into()); }
+    let canonical = resolved.to_string_lossy().to_string();
+    let mut config = manager.config.lock().map_err(|e| e.to_string())?;
+    if config.allowed_folders.iter().any(|p| p.eq_ignore_ascii_case(&canonical)) { return Ok(()); }
+    let mut proposed = config.clone();
+    proposed.allowed_folders.push(canonical);
+    manager.save_config(&proposed)?;
+    *config = proposed;
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_folder(manager: State<'_, CommanderState>, path: String) -> Result<(), String> {
+    let mut config = manager.config.lock().map_err(|e| e.to_string())?;
+    let mut proposed = config.clone();
+    proposed.allowed_folders.retain(|p| !p.eq_ignore_ascii_case(&path));
+    manager.save_config(&proposed)?;
+    *config = proposed;
+    // Revocation must also terminate any old in-flight tool or shell session.
+    if manager.is_running()? { manager.signal_restart()?; }
+    Ok(())
+}
+
+fn quote_command(path: &Path) -> String { format!("\"{}\"", path.to_string_lossy().replace('"', "")) }
+
+#[tauri::command]
+fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
+    if manager.is_running()? { return Ok(()); }
+    manager.runtime_check()?;
+    let config = manager.config.lock().map_err(|e| e.to_string())?.clone();
+    validate_tunnel_id(&config.tunnel_id)?;
+    let api_key = secret_entry()?.get_password().map_err(|_| "No stored API key. Open Connection settings.".to_string())?;
+    if api_key.trim().is_empty() { return Err("No stored API key.".into()); }
+    let (tunnel, node, dc, transport, guard) = manager.runtime_files();
+    let profile_dir = manager.data_dir.join("profiles");
+    let logs = manager.data_dir.join("logs");
+    let spool = manager.data_dir.join("spool");
+    for directory in [&profile_dir, &logs, &spool] {
+        fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    }
+    manager.save_config(&config)?;
+    // Never reuse a previous process's health file for this new connection.
+    let _ = fs::remove_file(logs.join("health.url"));
+    // The transport proxy owns MCP session replay and backend recovery.
+    // The policy proxy between it and DC enforces the local allowlist.
+    let mcp_command = format!("{} {} -- {} {} -- {} {} --no-onboarding",
+        quote_command(&node), quote_command(&transport),
+        quote_command(&node), quote_command(&guard),
+        quote_command(&node), quote_command(&dc));
+    let profile = serde_json::json!({
+        "admin_ui": { "open_browser": false },
+        "config_version": 1,
+        "control_plane": { "api_key": "env:CONTROL_PLANE_API_KEY", "base_url": "https://api.openai.com", "tunnel_id": config.tunnel_id },
+        "health": { "listen_addr": "127.0.0.1:0", "url_file": logs.join("health.url").to_string_lossy() },
+        "log": { "file": logs.join("tunnel.log").to_string_lossy(), "format": "json", "level": "info" },
+        "mcp": { "commands": [{ "channel": "main", "command": mcp_command }] }
+    });
+    fs::write(profile_dir.join("commander-manager.yaml"),
+        serde_json::to_vec_pretty(&profile).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let mut child = Command::new(tunnel);
+    // Always name the exact manager-owned profile. Supplying a directory alone
+    // does not select a profile in tunnel-client.
+    child.arg("run").arg("--profile-file").arg(profile_dir.join("commander-manager.yaml"))
+        .env("CONTROL_PLANE_API_KEY", api_key)
+        .env("DESKTOP_COMMANDER_DISABLE_TELEMETRY", "1")
+        .env("MCP_STDIO_SEND_INITIALIZED_NOTIFICATION", "1")
+        .env("DC_REMOTE_DEVICE", "true")
+        .env("MCP_ACCESS_POLICY_PATH", manager.policy_path())
+        .env("MCP_PROXY_RESTART_TRIGGER", manager.restart_trigger())
+        .env("MCP_PROXY_SPOOL_DIR", spool)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    { use std::os::windows::process::CommandExt; child.creation_flags(0x08000000); }
+    let process = child.spawn().map_err(|e| format!("Could not start tunnel-client: {e}"))?;
+    *manager.process.lock().map_err(|e| e.to_string())? = Some(process);
+    Ok(())
+}
+
+#[tauri::command]
+fn disconnect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> { manager.stop() }
+
+#[tauri::command]
+fn restart_dc(manager: State<'_, CommanderState>) -> Result<(), String> {
+    if !manager.is_running()? { return Err("Tunnel is not running.".into()); }
+    manager.signal_restart()
+}
+
+#[tauri::command]
+fn exit_manager(app: AppHandle, manager: State<'_, CommanderState>) -> Result<(), String> {
+    manager.stop()?;
+    app.exit(0);
+    Ok(())
+}
+
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let directory = app.path().app_local_data_dir()?;
+            fs::create_dir_all(&directory)?;
+            let settings_path = directory.join("settings.json");
+            let settings = if settings_path.is_file() {
+                serde_json::from_slice::<Settings>(&fs::read(&settings_path)?)?
+            } else { Settings::default() };
+            let manager = CommanderState {
+                config: Mutex::new(settings.clone()),
+                process: Mutex::new(None),
+                data_dir: directory,
+                resource_dir: app.path().resource_dir()?,
+            };
+            manager.save_config(&settings)?;
+            app.manage(manager);
+            let open = MenuItem::with_id(app, "show", "Open manager", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().ok_or_else(|| std::io::Error::other("Missing app icon"))?.clone())
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => { if let Some(win) = app.get_webview_window("main") { let _ = win.show(); let _ = win.set_focus(); } },
+                    "quit" => {
+                        let state: State<'_, CommanderState> = app.state();
+                        if let Err(error) = state.stop() {
+                            eprintln!("Cannot quit manager: {error}");
+                        } else { app.exit(0); }
+                    },
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::DoubleClick { .. } = event {
+                        if let Some(win) = tray.app_handle().get_webview_window("main") { let _ = win.show(); let _ = win.set_focus(); }
+                    }
+                })
+                .build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_status, save_connection, set_restricted, add_folder,
+            remove_folder, connect_tunnel, disconnect_tunnel, restart_dc, exit_manager
+        ])
+        .run(tauri::generate_context!())
+        .expect("Error running Desktop Commander Manager");
+}

@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Desktop Commander Manager",
+  "version": "0.1.0",
+  "identifier": "ai.inonego.commander-manager",
+  "build": {
+    "beforeDevCommand": "npm run dev:ui",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build:ui",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Desktop Commander Manager",
+        "width": 420,
+        "height": 550,
+        "minWidth": 420,
+        "maxWidth": 420,
+        "minHeight": 550,
+        "maxHeight": 550,
+        "resizable": false,
+        "center": true,
+        "backgroundColor": "#15191f"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "resources/runtime/": "runtime/",
+      "resources/proxy/": "proxy/"
+    }
+  }
+}

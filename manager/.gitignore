@@ -1,0 +1,22 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.env
+.env.*
+!.env.example
+# Third-party runtime payload, rebuilt on release machine
+src-tauri/resources/runtime/**
+!src-tauri/resources/runtime/.gitkeep
+src-tauri/resources/proxy/MCPStdioProxy.mjs
+# Never commit user-local connection data if debug/test runs move them here
+**/settings.json
+**/access-policy.json
+**/restart-request.txt
+**/commander-manager.yaml
+**/profiles/
+**/state/
+**/credentials/
+**/*.secret
+**/*.token

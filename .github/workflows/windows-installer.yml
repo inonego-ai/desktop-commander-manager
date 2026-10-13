@@ -1,0 +1,60 @@
+name: Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Configure Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: manager/src-tauri
+      - name: Prepare bundled tunnel and MCP runtimes
+        shell: pwsh
+        run: ./manager/scripts/Prepare-Release.ps1
+      - name: Install frontend dependencies
+        working-directory: manager
+        run: npm install --no-audit --no-fund
+      - name: Verify proxy policy tests
+        working-directory: manager
+        run: npm run test:proxy
+      - name: Verify Svelte types
+        working-directory: manager
+        run: npm run check
+      - name: Check for accidentally bundled local credentials
+        working-directory: manager
+        run: npm run check:release
+      - name: Build bundled installer
+        working-directory: manager
+        run: npm run build
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: commander-manager-windows-installer
+          path: manager/src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish installer on tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Get-ChildItem -Path manager/src-tauri/target/release/bundle/nsis -Filter "*-setup.exe" -File | Select-Object -First 1
+          if (-not $installer) { throw "Installer missing" }
+          gh release create $env:GITHUB_REF_NAME $installer.FullName --title "Desktop Commander Manager $env:GITHUB_REF_NAME" --notes "Windows NSIS installer. Each user provides their own tunnel ID and runtime key."
