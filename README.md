@@ -13,7 +13,7 @@ Download the latest Windows `*-setup.exe` from [Releases](https://github.com/ino
 - Live file-access policy in restricted mode; arbitrary shell/process tools disabled
 - Connect/disconnect tunnel and restart Desktop Commander backend
 - API key stored in Windows Credential Manager, never in tracked configuration
-- Vendor runtimes bundled in the Windows installer; end users do not install Node manually
+- Vendor runtimes bundled in the Windows installer, with third-party license notices; end users do not install Node manually
 
 **Security boundary:** allowed folders restrict MCP file tools; this is not a Windows OS sandbox. Unrestricted mode grants file and shell access with the Windows account permissions. Existing in-flight actions may need interruption when access becomes more restrictive.
 

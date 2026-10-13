@@ -40,6 +40,11 @@ try {
     $tunnelExe = Get-ChildItem -LiteralPath $tunnelExtract -Filter 'tunnel-client.exe' -Recurse -File | Select-Object -First 1
     if (-not $tunnelExe) { throw 'Missing tunnel-client.exe in verified archive.' }
     Copy-Item -LiteralPath $tunnelExe.FullName -Destination (Join-Path $runtime 'tunnel-client.exe') -Force
+    $licenses = Join-Path $runtime 'licenses'
+    New-Item -ItemType Directory -Path $licenses -Force | Out-Null
+    foreach ($licenseFile in @('LICENSE', 'NOTICE')) {
+        Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/openai/tunnel-client/v$TunnelClientVersion/$licenseFile" -OutFile (Join-Path $licenses "tunnel-client-$licenseFile")
+    }
 
     $nodeArchive = "node-v$NodeVersion-win-x64.zip"
     $nodeUrlBase = "https://nodejs.org/dist/v$NodeVersion"
@@ -49,6 +54,9 @@ try {
     $nodeExe = Get-ChildItem -LiteralPath $nodeExtract -Filter 'node.exe' -Recurse -File | Select-Object -First 1
     if (-not $nodeExe) { throw 'Missing node.exe in verified archive.' }
     Copy-Item -LiteralPath $nodeExe.FullName -Destination (Join-Path $runtime 'node.exe') -Force
+    $nodeLicense = Get-ChildItem -LiteralPath $nodeExtract -Filter 'LICENSE' -Recurse -File | Select-Object -First 1
+    if (-not $nodeLicense) { throw 'Node.js license file missing from the official archive.' }
+    Copy-Item -LiteralPath $nodeLicense.FullName -Destination (Join-Path $licenses 'node-LICENSE') -Force
 
     & npm.cmd install --prefix $runtime --omit=dev --ignore-scripts --no-save --no-audit --no-fund "@wonderwhy-er/desktop-commander@$DesktopCommanderVersion"
     if ($LASTEXITCODE -ne 0) { throw 'Desktop Commander runtime install failed.' }
@@ -56,6 +64,9 @@ try {
     if (-not (Test-Path $installedPkg)) { throw 'Desktop Commander package is missing.' }
     $installedVersion = [string]((Get-Content $installedPkg -Raw | ConvertFrom-Json).version)
     if ($installedVersion -ne $DesktopCommanderVersion) { throw "Unexpected Desktop Commander version: $installedVersion" }
+    $dcLicense = Join-Path (Split-Path -Parent $installedPkg) 'LICENSE'
+    if (-not (Test-Path -LiteralPath $dcLicense -PathType Leaf)) { throw 'Desktop Commander license file missing.' }
+    Copy-Item -LiteralPath $dcLicense -Destination (Join-Path $licenses 'desktop-commander-LICENSE') -Force
     # Reapply the pinned upstream fix on every release build; never modify the user's live runtime.
     & node (Join-Path $PSScriptRoot 'Patch-DesktopCommander.mjs') $runtime
     if ($LASTEXITCODE -ne 0) { throw 'Desktop Commander stream cleanup patch failed.' }
