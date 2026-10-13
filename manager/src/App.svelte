@@ -81,14 +81,19 @@
       </div>
     </div>
     <div class="footnote"><span class="point">●</span>New requests use the updated policy immediately.</div>
-    {#if !status.runtime_ready}<div class="disabled-note" title={status.runtime_message}>Runtime not bundled — see README for packaging.</div>{/if}
-    <div class="spacer"></div>
     <div class="bottom">
       <button onclick={openSettings}><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d={icons.settings}/></svg>Connection settings</button>
       <button onclick={() => modal = 'exit'}><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d={icons.power}/></svg>Exit</button>
     </div>
-    {#if error}<div class="error" role="alert">{error}</div>{/if}
-    {#if notice}<div class="notice" role="status">{notice}</div>{/if}
+    <div class="feedback-slot" aria-live="polite" aria-atomic="true">
+      {#if error}
+        <div class="error" role="alert" title={error}>{error}</div>
+      {:else if notice}
+        <div class="notice" role="status" title={notice}>{notice}</div>
+      {:else if !status.runtime_ready}
+        <div class="disabled-note" title={status.runtime_message}>Runtime not bundled — see README for packaging.</div>
+      {/if}
+    </div>
   </main>
 </div>
 {#if modal !== 'none'}
