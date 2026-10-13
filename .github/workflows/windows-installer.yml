@@ -39,6 +39,9 @@ jobs:
       - name: Check for accidentally bundled local credentials
         working-directory: manager
         run: npm run check:release
+      - name: Verify Rust command quoting
+        working-directory: manager/src-tauri
+        run: cargo test
       - name: Build bundled installer
         working-directory: manager
         run: npm run build
@@ -57,4 +60,10 @@ jobs:
         run: |
           $installer = Get-ChildItem -Path manager/src-tauri/target/release/bundle/nsis -Filter "*-setup.exe" -File | Select-Object -First 1
           if (-not $installer) { throw "Installer missing" }
-          gh release create $env:GITHUB_REF_NAME $installer.FullName --title "Desktop Commander Manager $env:GITHUB_REF_NAME" --notes "Windows NSIS installer. Each user provides their own tunnel ID and runtime key."
+          gh release view $env:GITHUB_REF_NAME --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "Release $env:GITHUB_REF_NAME already exists. Preserving published installer assets."
+          } else {
+            gh release create $env:GITHUB_REF_NAME $installer.FullName --title "Desktop Commander Manager $env:GITHUB_REF_NAME" --notes "Windows NSIS installer. Each user provides their own tunnel ID and runtime key."
+            if ($LASTEXITCODE -ne 0) { throw "Failed to publish installer release" }
+          }

@@ -235,7 +235,11 @@ fn remove_folder(manager: State<'_, CommanderState>, path: String) -> Result<(),
     Ok(())
 }
 
-fn quote_command(path: &Path) -> String { format!("\"{}\"", path.to_string_lossy().replace('"', "")) }
+fn quote_command(path: &Path) -> String {
+    // The tunnel-client parses command strings with POSIX-like escaping, so
+    // native Windows backslashes would be consumed before process creation.
+    format!("\"{}\"", path.to_string_lossy().replace('\\', "/").replace('"', ""))
+}
 
 #[tauri::command]
 fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
@@ -304,6 +308,17 @@ fn exit_manager(app: AppHandle, manager: State<'_, CommanderState>) -> Result<()
     manager.stop()?;
     app.exit(0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_command;
+    use std::path::Path;
+
+    #[test]
+    fn quotes_windows_paths_without_backslash_escaping() {
+        assert_eq!(quote_command(Path::new(r"C:\Program Files\Node\node.exe")), "\"C:/Program Files/Node/node.exe\"");
+    }
 }
 
 pub fn run() {
