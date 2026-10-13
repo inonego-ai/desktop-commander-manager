@@ -1,6 +1,6 @@
 [package]
 name = "commander-manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "Secure MCP Tunnel local desktop manager"
 authors = ["inonego-ai"]
 edition = "2021"

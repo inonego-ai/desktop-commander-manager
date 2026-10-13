@@ -64,6 +64,6 @@ jobs:
           if ($LASTEXITCODE -eq 0) {
             Write-Output "Release $env:GITHUB_REF_NAME already exists. Preserving published installer assets."
           } else {
-            gh release create $env:GITHUB_REF_NAME $installer.FullName --title "Desktop Commander Manager $env:GITHUB_REF_NAME" --notes "Windows NSIS installer. Each user provides their own tunnel ID and runtime key."
+            gh release create $env:GITHUB_REF_NAME $installer.FullName --title "Desktop Commander Manager $env:GITHUB_REF_NAME" --notes "Windows NSIS installer. Each user provides their own tunnel ID and runtime key." --prerelease
             if ($LASTEXITCODE -ne 0) { throw "Failed to publish installer release" }
           }
