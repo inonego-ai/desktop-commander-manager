@@ -21,13 +21,14 @@ const KEY_ACCOUNT: &str = "current-user";
 #[serde(default)]
 struct Settings {
     tunnel_id: String,
+    organization_id: String,
     restricted: bool,
     allowed_folders: Vec<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { tunnel_id: String::new(), restricted: true, allowed_folders: Vec::new() }
+        Self { tunnel_id: String::new(), organization_id: String::new(), restricted: true, allowed_folders: Vec::new() }
     }
 }
 
@@ -38,6 +39,7 @@ struct Status {
     restricted: bool,
     allowed_folders: Vec<String>,
     tunnel_id: String,
+    organization_id: String,
     has_key: bool,
     runtime_ready: bool,
     runtime_message: String,
@@ -62,12 +64,7 @@ impl CommanderState {
 
     fn connection_issue(&self) -> Option<String> {
         let baseline = (*self.log_start.lock().ok()?)?;
-        let mut file = fs::File::open(self.tunnel_log()).ok()?;
-        let start = baseline.min(file.metadata().ok()?.len());
-        file.seek(SeekFrom::Start(start)).ok()?;
-        let mut lines = String::new();
-        file.take(65536).read_to_string(&mut lines).ok()?;
-        classify_connection_log(&lines).map(str::to_owned)
+        recent_connection_issue(&self.tunnel_log(), baseline)
     }
 
     fn save_config(&self, config: &Settings) -> Result<(), String> {
@@ -156,8 +153,22 @@ impl CommanderState {
 
 }
 
+fn recent_connection_issue(path: &Path, baseline: u64) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let end = file.metadata().ok()?.len();
+    // Read the newest bytes, not the oldest bytes since startup. Startup
+    // logging can exceed 64 KiB before the first control-plane response.
+    let start = baseline.min(end).max(end.saturating_sub(128 * 1024));
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    classify_connection_log(&String::from_utf8_lossy(&bytes)).map(str::to_owned)
+}
+
 fn classify_connection_log(log: &str) -> Option<&'static str> {
-    if log.contains("Unauthorized") || log.contains("status 401") {
+    if log.contains("tunnel_active_organization_required") {
+        Some("This tunnel requires an organization context. Enter the OpenAI Organization ID (org-...) in Connection settings.")
+    } else if log.contains("Unauthorized") || log.contains("status 401") {
         Some("Tunnel authentication failed (401). Check the API key and Tunnel ID in Connection settings.")
     } else if log.contains("status 403") || log.contains("Forbidden") {
         Some("Tunnel access denied (403). Check API key permissions for this Tunnel ID.")
@@ -173,6 +184,14 @@ fn secret_entry() -> Result<keyring::Entry, String> {
 fn secret_is_set() -> bool {
     secret_entry().and_then(|e| e.get_password().map_err(|e| e.to_string()))
         .is_ok_and(|value| !value.is_empty())
+}
+
+fn validate_organization_id(value: &str) -> Result<(), String> {
+    if !value.is_empty() && (!value.starts_with("org-") || value.len() > 128
+        || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+        return Err("Invalid Organization ID. Expected org-... or leave blank for an unrestricted account context.".into());
+    }
+    Ok(())
 }
 
 fn validate_tunnel_id(value: &str) -> Result<(), String> {
@@ -193,6 +212,7 @@ fn get_status(manager: State<'_, CommanderState>) -> Result<Status, String> {
         running, ready: running && connection_issue.is_none() && manager.is_ready(), restricted: config.restricted,
         allowed_folders: config.allowed_folders,
         tunnel_id: config.tunnel_id,
+        organization_id: config.organization_id,
         has_key: secret_is_set(),
         runtime_ready: runtime.is_ok(),
         runtime_message: runtime.err().unwrap_or_default(),
@@ -201,9 +221,10 @@ fn get_status(manager: State<'_, CommanderState>) -> Result<Status, String> {
 }
 
 #[tauri::command]
-fn save_connection(manager: State<'_, CommanderState>, tunnel_id: String, api_key: String) -> Result<(), String> {
+fn save_connection(manager: State<'_, CommanderState>, tunnel_id: String, organization_id: String, api_key: String) -> Result<(), String> {
     let id = tunnel_id.trim();
     validate_tunnel_id(id)?;
+    validate_organization_id(organization_id.trim())?;
     if manager.is_running()? { return Err("Disconnect the tunnel before changing credentials.".into()); }
     if !api_key.is_empty() && (api_key.trim().is_empty() || (api_key.contains('\r') || api_key.contains('\n'))) {
         return Err("API key must be nonblank and single-line.".into());
@@ -211,12 +232,14 @@ fn save_connection(manager: State<'_, CommanderState>, tunnel_id: String, api_ke
     let mut config = manager.config.lock().map_err(|e| e.to_string())?;
     let mut proposed = config.clone();
     proposed.tunnel_id = id.to_string();
+    proposed.organization_id = organization_id.trim().to_string();
     // Do not expose credential bytes in any settings or policy file.
     manager.save_config(&proposed)?;
     if !api_key.is_empty() {
         secret_entry()?.set_password(&api_key).map_err(|e| format!("Credential Manager error: {e}"))?;
     }
     *config = proposed;
+    *manager.log_start.lock().map_err(|e| e.to_string())? = None;
     Ok(())
 }
 
@@ -272,6 +295,7 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
     manager.runtime_check()?;
     let config = manager.config.lock().map_err(|e| e.to_string())?.clone();
     validate_tunnel_id(&config.tunnel_id)?;
+    validate_organization_id(&config.organization_id)?;
     let api_key = secret_entry()?.get_password().map_err(|_| "No stored API key. Open Connection settings.".to_string())?;
     if api_key.trim().is_empty() { return Err("No stored API key.".into()); }
     let (tunnel, node, dc, transport, guard) = manager.runtime_files();
@@ -290,7 +314,7 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
         quote_command(&node), quote_command(&transport),
         quote_command(&node), quote_command(&guard),
         quote_command(&node), quote_command(&dc));
-    let profile = serde_json::json!({
+    let mut profile = serde_json::json!({
         "admin_ui": { "open_browser": false },
         "config_version": 1,
         "control_plane": { "api_key": "env:CONTROL_PLANE_API_KEY", "base_url": "https://api.openai.com", "tunnel_id": config.tunnel_id },
@@ -298,6 +322,9 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
         "log": { "file": logs.join("tunnel.log").to_string_lossy(), "format": "json", "level": "info" },
         "mcp": { "commands": [{ "channel": "main", "command": mcp_command }] }
     });
+    if !config.organization_id.is_empty() {
+        profile["control_plane"]["organization_id"] = serde_json::Value::String(config.organization_id.clone());
+    }
     fs::write(profile_dir.join("commander-manager.yaml"),
         serde_json::to_vec_pretty(&profile).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let mut child = Command::new(tunnel);
@@ -327,7 +354,11 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn disconnect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> { manager.stop() }
+fn disconnect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
+    manager.stop()?;
+    *manager.log_start.lock().map_err(|e| e.to_string())? = None;
+    Ok(())
+}
 
 #[tauri::command]
 fn restart_dc(manager: State<'_, CommanderState>) -> Result<(), String> {
@@ -364,6 +395,24 @@ mod tests {
         assert!(super::classify_connection_log("poll failed: 401 Unauthorized").unwrap().contains("authentication"));
         assert!(super::classify_connection_log("OnStart hook failed: raw username path").unwrap().contains("MCP backend"));
         assert!(super::classify_connection_log("request body: secret-example").is_none());
+        assert!(super::classify_connection_log("401: tunnel_active_organization_required").unwrap().contains("Organization ID"));
+    }
+
+    #[test]
+    fn permits_optional_organization_context() {
+        assert!(super::validate_organization_id("").is_ok());
+        assert!(super::validate_organization_id("org-example123").is_ok());
+        assert!(super::validate_organization_id("wrong_id").is_err());
+    }
+
+    #[test]
+    fn discovers_errors_after_large_utf8_startup_logs() {
+        let file = std::env::temp_dir().join(format!("commander-startup-log-{}.txt", std::process::id()));
+        let startup = "startup ☑ ".repeat(9000);
+        std::fs::write(&file, format!("{startup}\n401: tunnel_active_organization_required\n")).unwrap();
+        let issue = super::recent_connection_issue(&file, 0);
+        let _ = std::fs::remove_file(&file);
+        assert!(issue.unwrap().contains("Organization ID"));
     }
 }
 

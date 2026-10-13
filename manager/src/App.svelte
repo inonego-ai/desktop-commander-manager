@@ -3,14 +3,15 @@
   import { invoke } from '@tauri-apps/api/core';
   import { open } from '@tauri-apps/plugin-dialog';
 
-  type Status = { running: boolean; ready: boolean; restricted: boolean; allowed_folders: string[]; tunnel_id: string; has_key: boolean; runtime_ready: boolean; runtime_message: string; connection_issue: string | null };
-  let status = $state<Status>({ running: false, ready: false, restricted: true, allowed_folders: [], tunnel_id: '', has_key: false, runtime_ready: false, runtime_message: '', connection_issue: null });
+  type Status = { running: boolean; ready: boolean; restricted: boolean; allowed_folders: string[]; tunnel_id: string; organization_id: string; has_key: boolean; runtime_ready: boolean; runtime_message: string; connection_issue: string | null };
+  let status = $state<Status>({ running: false, ready: false, restricted: true, allowed_folders: [], tunnel_id: '', organization_id: '', has_key: false, runtime_ready: false, runtime_message: '', connection_issue: null });
   let selected = $state<string | null>(null);
   let modal = $state<'none' | 'settings' | 'unrestricted' | 'exit' | 'restart'>('none');
   let working = $state(false);
   let error = $state('');
   let notice = $state('');
   let newTunnelID = $state('');
+  let newOrganizationID = $state('');
   let newKey = $state('');
 
   const icons: Record<string,string> = {
@@ -37,7 +38,7 @@
       if (typeof selectedPath === 'string') await execute(() => invoke('add_folder', { path: selectedPath }), '폴더가 허용 목록에 추가되었습니다.');
     } catch (e) { error = String(e); }
   }
-  function openSettings() { newTunnelID = status.tunnel_id; newKey = ''; modal = 'settings'; }
+  function openSettings() { newTunnelID = status.tunnel_id; newOrganizationID = status.organization_id; newKey = ''; modal = 'settings'; }
 </script>
 
 <svelte:head><title>Desktop Commander Manager</title></svelte:head>
@@ -104,8 +105,9 @@
     {#if modal === 'settings'}
       <h2>Connection settings</h2><p>Each user must enter their own Secure MCP Tunnel details. The API key is stored in Windows Credential Manager, not in the EXE.</p>
       <div class="field"><label for="tunnel-id">Tunnel ID</label><input id="tunnel-id" autocomplete="off" bind:value={newTunnelID} placeholder="tunnel_..."/></div>
+      <div class="field"><label for="org-id">Organization ID (if required)</label><input id="org-id" autocomplete="off" bind:value={newOrganizationID} placeholder="org-..."/><div class="hint">Required when your tunnel uses organization-scoped access.</div></div>
       <div class="field"><label for="api-key">Control Plane API key</label><input id="api-key" type="password" autocomplete="new-password" bind:value={newKey} placeholder={status.has_key ? 'Saved — leave empty to keep' : 'Enter your API key'}/><div class="hint">Leave blank to preserve the existing key. Key values are never shown.</div></div>
-      <div class="modal-actions"><button class="btn" onclick={() => modal = 'none'}>Cancel</button><button class="btn" disabled={working} onclick={() => execute(async () => {await invoke('save_connection',{tunnelId:newTunnelID, apiKey:newKey});modal='none';newKey='';},'연결 정보가 저장되었습니다.')}>Save</button></div>
+      <div class="modal-actions"><button class="btn" onclick={() => modal = 'none'}>Cancel</button><button class="btn" disabled={working} onclick={() => execute(async () => {await invoke('save_connection',{tunnelId:newTunnelID, organizationId:newOrganizationID, apiKey:newKey});modal='none';newKey='';},'연결 정보가 저장되었습니다.')}>Save</button></div>
     {:else if modal === 'unrestricted'}
       <h2>Disable directory restriction?</h2><p class="warn">Desktop Commander will be able to access files and run commands with your Windows user permissions.</p>
       <div class="modal-actions"><button class="btn" onclick={() => modal = 'none'}>Cancel</button><button class="btn" onclick={() => execute(async()=>{await invoke('set_restricted',{restricted:false});modal='none';},'전체 접근 모드입니다.')}>Allow full access</button></div>
