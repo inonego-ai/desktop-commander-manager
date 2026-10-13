@@ -3,8 +3,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { open } from '@tauri-apps/plugin-dialog';
 
-  type Status = { running: boolean; ready: boolean; restricted: boolean; allowed_folders: string[]; tunnel_id: string; has_key: boolean; runtime_ready: boolean; runtime_message: string };
-  let status = $state<Status>({ running: false, ready: false, restricted: true, allowed_folders: [], tunnel_id: '', has_key: false, runtime_ready: false, runtime_message: '' });
+  type Status = { running: boolean; ready: boolean; restricted: boolean; allowed_folders: string[]; tunnel_id: string; has_key: boolean; runtime_ready: boolean; runtime_message: string; connection_issue: string | null };
+  let status = $state<Status>({ running: false, ready: false, restricted: true, allowed_folders: [], tunnel_id: '', has_key: false, runtime_ready: false, runtime_message: '', connection_issue: null });
   let selected = $state<string | null>(null);
   let modal = $state<'none' | 'settings' | 'unrestricted' | 'exit' | 'restart'>('none');
   let working = $state(false);
@@ -45,11 +45,11 @@
   <header class="top">
     <div class="logo">›_</div>
     <div class="grow"><div class="name">Desktop Commander</div><div class="sub">Remote manager</div></div>
-    <div class:up={status.ready} class="status"><span class="dot"></span>{status.ready ? 'Ready' : status.running ? 'Starting' : 'Stopped'}</div>
+    <div class:up={status.ready} class:failed={Boolean(status.connection_issue)} class="status"><span class="dot"></span>{status.connection_issue ? 'Error' : status.ready ? 'Ready' : status.running ? 'Starting' : 'Stopped'}</div>
   </header>
   <main class="content">
     <div class="actions">
-      <button class="btn" disabled={working} onclick={() => execute(() => invoke(status.running ? 'disconnect_tunnel' : 'connect_tunnel'), status.running ? '터널 연결을 해제했습니다.' : '터널 실행 명령을 보냈습니다.')}>
+      <button class="btn" disabled={working} onclick={() => execute(() => invoke(status.running ? 'disconnect_tunnel' : 'connect_tunnel'), status.running ? '터널 연결을 해제했습니다.' : '터널 실행을 시작했습니다. 연결 상태를 확인 중입니다.')}>
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d={icons.unplug}/></svg>
         {status.running ? 'Disconnect' : 'Connect'}
       </button>
@@ -88,6 +88,8 @@
     <div class="feedback-slot" aria-live="polite" aria-atomic="true">
       {#if error}
         <div class="error" role="alert" title={error}>{error}</div>
+      {:else if status.connection_issue}
+        <div class="error" role="alert" title={status.connection_issue}>{status.connection_issue}</div>
       {:else if notice}
         <div class="notice" role="status" title={notice}>{notice}</div>
       {:else if !status.runtime_ready}

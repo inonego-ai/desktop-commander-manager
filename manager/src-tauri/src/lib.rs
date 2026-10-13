@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -41,6 +41,7 @@ struct Status {
     has_key: bool,
     runtime_ready: bool,
     runtime_message: String,
+    connection_issue: Option<String>,
 }
 
 struct CommanderState {
@@ -48,6 +49,7 @@ struct CommanderState {
     process: Mutex<Option<Child>>,
     data_dir: PathBuf,
     resource_dir: PathBuf,
+    log_start: Mutex<Option<u64>>,
 }
 
 impl CommanderState {
@@ -56,6 +58,17 @@ impl CommanderState {
     // Keeping one source of truth prevents a half-written mode transition.
     fn policy_path(&self) -> PathBuf { self.settings_path() }
     fn restart_trigger(&self) -> PathBuf { self.data_dir.join("restart-request.txt") }
+    fn tunnel_log(&self) -> PathBuf { self.data_dir.join("logs").join("tunnel.log") }
+
+    fn connection_issue(&self) -> Option<String> {
+        let baseline = (*self.log_start.lock().ok()?)?;
+        let mut file = fs::File::open(self.tunnel_log()).ok()?;
+        let start = baseline.min(file.metadata().ok()?.len());
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut lines = String::new();
+        file.take(65536).read_to_string(&mut lines).ok()?;
+        classify_connection_log(&lines).map(str::to_owned)
+    }
 
     fn save_config(&self, config: &Settings) -> Result<(), String> {
         let serialized = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
@@ -143,6 +156,16 @@ impl CommanderState {
 
 }
 
+fn classify_connection_log(log: &str) -> Option<&'static str> {
+    if log.contains("Unauthorized") || log.contains("status 401") {
+        Some("Tunnel authentication failed (401). Check the API key and Tunnel ID in Connection settings.")
+    } else if log.contains("status 403") || log.contains("Forbidden") {
+        Some("Tunnel access denied (403). Check API key permissions for this Tunnel ID.")
+    } else if log.contains("OnStart hook failed") || log.contains("start stdio command") {
+        Some("Could not start the bundled MCP backend. Check the installed runtime.")
+    } else { None }
+}
+
 fn secret_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT).map_err(|e| e.to_string())
 }
@@ -153,9 +176,9 @@ fn secret_is_set() -> bool {
 }
 
 fn validate_tunnel_id(value: &str) -> Result<(), String> {
-    if !value.starts_with("tunnel_") || value.len() > 180
-        || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-        return Err("Invalid tunnel ID. Expected tunnel_ followed by letters, digits, or underscores.".into());
+    if value.len() != 39 || !value.starts_with("tunnel_")
+        || !value[7..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+        return Err("Invalid Tunnel ID. Expected tunnel_ followed by 32 lowercase letters or digits.".into());
     }
     Ok(())
 }
@@ -165,13 +188,15 @@ fn get_status(manager: State<'_, CommanderState>) -> Result<Status, String> {
     let running = manager.is_running()?;
     let config = manager.config.lock().map_err(|e| e.to_string())?.clone();
     let runtime = manager.runtime_check();
+    let connection_issue = manager.connection_issue();
     Ok(Status {
-        running, ready: running && manager.is_ready(), restricted: config.restricted,
+        running, ready: running && connection_issue.is_none() && manager.is_ready(), restricted: config.restricted,
         allowed_folders: config.allowed_folders,
         tunnel_id: config.tunnel_id,
         has_key: secret_is_set(),
         runtime_ready: runtime.is_ok(),
         runtime_message: runtime.err().unwrap_or_default(),
+        connection_issue,
     })
 }
 
@@ -289,8 +314,15 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     { use std::os::windows::process::CommandExt; child.creation_flags(0x08000000); }
+    // Inspect only messages created by this connection attempt, never stale errors.
+    let log_length = fs::metadata(manager.tunnel_log()).map(|m| m.len()).unwrap_or(0);
+    *manager.log_start.lock().map_err(|e| e.to_string())? = Some(log_length);
     let process = child.spawn().map_err(|e| format!("Could not start tunnel-client: {e}"))?;
     *manager.process.lock().map_err(|e| e.to_string())? = Some(process);
+    std::thread::sleep(Duration::from_millis(450));
+    if !manager.is_running()? {
+        return Err(manager.connection_issue().unwrap_or_else(|| "Tunnel client exited during startup. Check the runtime installation.".into()));
+    }
     Ok(())
 }
 
@@ -319,6 +351,20 @@ mod tests {
     fn quotes_windows_paths_without_backslash_escaping() {
         assert_eq!(quote_command(Path::new(r"C:\Program Files\Node\node.exe")), "\"C:/Program Files/Node/node.exe\"");
     }
+
+    #[test]
+    fn rejects_invalid_tunnel_id_before_launch() {
+        assert!(super::validate_tunnel_id(&format!("tunnel_{}", "a".repeat(32))).is_ok());
+        assert!(super::validate_tunnel_id("tunnel_invalid").is_err());
+        assert!(super::validate_tunnel_id(&format!("tunnel_{}", "A".repeat(32))).is_err());
+    }
+
+    #[test]
+    fn reports_only_safe_connection_diagnostics() {
+        assert!(super::classify_connection_log("poll failed: 401 Unauthorized").unwrap().contains("authentication"));
+        assert!(super::classify_connection_log("OnStart hook failed: raw username path").unwrap().contains("MCP backend"));
+        assert!(super::classify_connection_log("request body: secret-example").is_none());
+    }
 }
 
 pub fn run() {
@@ -336,6 +382,7 @@ pub fn run() {
                 process: Mutex::new(None),
                 data_dir: directory,
                 resource_dir: app.path().resource_dir()?,
+                log_start: Mutex::new(None),
             };
             manager.save_config(&settings)?;
             app.manage(manager);
