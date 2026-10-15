@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -12,7 +12,7 @@ const sourceRoot = path.dirname(here);
 const proxyPath = path.join(sourceRoot, 'src', 'MCPStdioProxy.mjs');
 const mockPath = path.join(here, 'fixtures', 'MockMCPServer.mjs');
 
-function createClient(spoolDirectory) {
+function createClient(spoolDirectory, restartMarker) {
     const child = spawn(process.execPath, [proxyPath, '--', process.execPath, mockPath], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: {
@@ -21,7 +21,8 @@ function createClient(spoolDirectory) {
             CONTROL_PLANE_TUNNEL_ID: 'must-not-reach-backend',
             MCP_PROXY_MAX_MESSAGE_BYTES: '65536',
             MCP_PROXY_RESTART_TIMEOUT_MS: '1000',
-            MCP_PROXY_SPOOL_DIR: spoolDirectory
+            MCP_PROXY_SPOOL_DIR: spoolDirectory,
+            MCP_BACKEND_RESTART_TRIGGER: restartMarker
         }
     });
     const output = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
@@ -66,9 +67,28 @@ async function initialize(client) {
 
 test('proxy owns transport, UI, secret, and backend lifecycle boundaries', async () => {
     const spool = await mkdtemp(path.join(os.tmpdir(), 'mcp-proxy-test-'));
-    const client = createClient(spool);
+    const restartMarker = path.join(spool, 'backend-restart.request');
+    await writeFile(restartMarker, 'initial');
+    const client = createClient(spool, restartMarker);
     try {
         await initialize(client);
+
+        const transportState = async id => JSON.parse((await client.request(id, 'tools/call', {
+            name: 'mcp_transport_status', arguments: {}
+        })).result.content[0].text);
+        const initializedState = await transportState('before-duplicate');
+        const duplicate = await client.request('duplicate-initialize', 'initialize', {
+            protocolVersion: '2025-06-18',
+            capabilities: {},
+            clientInfo: { name: 'proxy-test', version: '1.0.0' }
+        });
+        assert.equal(duplicate.result.serverInfo.name, 'mock-mcp');
+        client.notify('notifications/initialized');
+        const duplicateState = await transportState('after-duplicate');
+        assert.equal(duplicateState.backendGeneration, initializedState.backendGeneration,
+            'identical initialize must not restart Desktop Commander');
+        assert.equal(duplicateState.cachedInitializeResponses, 1);
+        assert.equal(duplicateState.suppressedInitializedNotifications, 1);
 
         const tools = await client.request('tools', 'tools/list');
         const names = tools.result.tools.map(tool => tool.name);
@@ -105,6 +125,23 @@ test('proxy owns transport, UI, secret, and backend lifecycle boundaries', async
 
         const afterRestart = await client.request('after-restart', 'tools/list');
         assert(Array.isArray(afterRestart.result.tools));
+        const beforeManagerRestart = await transportState('before-manager-restart');
+        await writeFile(restartMarker, 'manager-requested-restart');
+        let afterManagerRestart;
+        for (let i = 0; i < 45; i += 1) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            afterManagerRestart = await transportState('manager-restart-' + i);
+            if (afterManagerRestart.backendGeneration > beforeManagerRestart.backendGeneration &&
+                afterManagerRestart.backendReady) break;
+        }
+        assert(afterManagerRestart.backendGeneration > beforeManagerRestart.backendGeneration,
+            'manager restart request must reach the transport proxy without a policy shim');
+        assert.equal(afterManagerRestart.backendReady, true);
+        assert.equal(afterManagerRestart.sessionInitialized, true);
+        const afterSignal = await client.request('after-manager-signal', 'tools/call', {
+            name: 'mock', arguments: {}
+        });
+        assert.equal(afterSignal.result.content[0].text, 'ok');
     } finally {
         client.child.kill('SIGTERM');
         await rm(spool, { recursive: true, force: true });

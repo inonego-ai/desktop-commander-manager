@@ -11,7 +11,10 @@ $project = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $runtime = Join-Path $project 'src-tauri\resources\runtime'
 $proxy = Join-Path $project 'src-tauri\resources\proxy'
 $stage = Join-Path $env:TEMP ('commander-release-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $runtime, $proxy, $stage | Out-Null
+New-Item -ItemType Directory -Force -Path $runtime, $stage | Out-Null
+# Build resources from a clean staging directory; ship only declared assets.
+if (Test-Path -LiteralPath $proxy) { Remove-Item -LiteralPath $proxy -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $proxy | Out-Null
 
 function Get-VerifiedArchive([string]$url, [string]$archive, [string]$checksumUrl) {
     $archivePath = Join-Path $stage $archive
@@ -28,7 +31,7 @@ function Get-VerifiedArchive([string]$url, [string]$archive, [string]$checksumUr
 
 try {
     if (-not (Test-Path -LiteralPath $TransportProxySource -PathType Leaf)) {
-        throw "MCPStdioProxy.mjs not found at $TransportProxySource. Place this manager/ directory under desktop-commander-mcp-tunnel/source/ or supply -TransportProxySource."
+        throw "MCPStdioProxy.mjs not found at $TransportProxySource. Keep manager/ beside src/ in this repository or supply -TransportProxySource."
     }
     Copy-Item -LiteralPath $TransportProxySource -Destination (Join-Path $proxy 'MCPStdioProxy.mjs') -Force
 

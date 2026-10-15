@@ -12,6 +12,7 @@ for (const name of ['CONTROL_PLANE_API_KEY', 'CONTROL_PLANE_TUNNEL_ID']) {
 
 const MAX_MESSAGE_BYTES = envInt('MCP_PROXY_MAX_MESSAGE_BYTES', 8 * 1024 * 1024, 64 * 1024);
 const RESTART_TIMEOUT_MS = envInt('MCP_PROXY_RESTART_TIMEOUT_MS', 10_000, 1_000);
+const RESTART_TRIGGER = process.env.MCP_BACKEND_RESTART_TRIGGER;
 const SPOOL_MAX_FILES = envInt('MCP_PROXY_SPOOL_MAX_FILES', 20, 1);
 const SPOOL_MAX_BYTES = envInt('MCP_PROXY_SPOOL_MAX_BYTES', 512 * 1024 * 1024, 1024 * 1024);
 const SPOOL_MAX_AGE_MS = envInt('MCP_PROXY_SPOOL_MAX_AGE_MS', 24 * 60 * 60 * 1000, 60 * 1000);
@@ -153,6 +154,8 @@ class MCPStdioProxy {
         this.filteredUiResources = 0;
         this.suppressedUiResourceReads = 0;
         this.suppressedUiToolCalls = 0;
+        this.restartToken = '';
+        this.restartTimer = null;
     }
 
     log(message) {
@@ -168,6 +171,13 @@ class MCPStdioProxy {
         await fs.mkdir(spoolDirectory, { recursive: true });
         await this.cleanupSpool();
         await this.spawnChild(false);
+        if (RESTART_TRIGGER) {
+            this.restartToken = await fs.readFile(RESTART_TRIGGER, 'utf8').catch(() => '');
+            this.restartTimer = setInterval(() => {
+                void this.checkManagerRestart().catch(error => this.log('restart request failed: ' + error));
+            }, 300);
+            this.restartTimer.unref();
+        }
         const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
         input.on('line', line => {
             this.parentQueue = this.parentQueue.then(() => this.handleParentLine(line)).catch(error => this.log(`parent message failed: ${error}`));
@@ -176,6 +186,13 @@ class MCPStdioProxy {
         process.on('SIGINT', () => void this.shutdown());
         process.on('SIGTERM', () => void this.shutdown());
         this.log(`started child=${childCommand} maxBytes=${MAX_MESSAGE_BYTES}`);
+    }
+
+    async checkManagerRestart() {
+        const token = await fs.readFile(RESTART_TRIGGER, 'utf8').catch(() => '');
+        if (!token || token === this.restartToken || this.shuttingDown) return;
+        this.restartToken = token;
+        await this.restartChild('manager requested Desktop Commander restart');
     }
 
     async spawnChild(replaySession) {
@@ -663,12 +680,31 @@ class MCPStdioProxy {
         if (!child) return;
         this.expectedExit = child;
         if (child.exitCode === null) {
-            child.kill('SIGTERM');
-            await Promise.race([
-                new Promise(resolve => child.once('exit', resolve)),
-                new Promise(resolve => setTimeout(resolve, RESTART_TIMEOUT_MS))
-            ]);
-            if (child.exitCode === null) child.kill('SIGKILL');
+            if (process.platform === 'win32' && child.pid) {
+                // Terminate the owned process tree, including PowerShell children.
+                const killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+                    windowsHide: true, stdio: 'ignore'
+                });
+                // Do not block the MCP event loop while Windows stops the
+                // backend and any PowerShell processes it created.
+                await new Promise(resolve => {
+                    const finish = () => { clearTimeout(timer); resolve(); };
+                    const timer = setTimeout(() => {
+                        killer.kill();
+                        resolve();
+                    }, RESTART_TIMEOUT_MS);
+                    killer.once('exit', finish);
+                    killer.once('error', finish);
+                });
+            }
+            if (child.exitCode === null) {
+                child.kill('SIGTERM');
+                await Promise.race([
+                    new Promise(resolve => child.once('exit', resolve)),
+                    new Promise(resolve => setTimeout(resolve, RESTART_TIMEOUT_MS))
+                ]);
+                if (child.exitCode === null) child.kill('SIGKILL');
+            }
         }
         if (this.child === child) this.child = null;
         this.expectedExit = null;
@@ -688,6 +724,7 @@ class MCPStdioProxy {
     async shutdown() {
         if (this.shuttingDown) return;
         this.shuttingDown = true;
+        if (this.restartTimer) clearInterval(this.restartTimer);
         this.pending.clear();
         for (const internal of this.internal.values()) {
             clearTimeout(internal.timer);

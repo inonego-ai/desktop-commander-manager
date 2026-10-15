@@ -4,8 +4,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const forbiddenNames = new Set(['.env', 'settings.json', 'access-policy.json',
-  'restart-request.txt', 'commander-manager.yaml', 'credentials.json']);
+const forbiddenNames = new Set(['.env', 'connection.json', 'settings.json',
+  'backend-restart.request', 'commander-manager.yaml', 'credentials.json']);
 const forbiddenExts = new Set(['.pem', '.p12', '.pfx', '.token', '.secret']);
 const keyShape = /\bsk-(?:proj-|svcacct-|admin-|org-)?[A-Za-z0-9_-]{20,}\b/;
 const dirs = ['src', 'src-tauri/src', 'src-tauri/resources', 'scripts', 'tests'];

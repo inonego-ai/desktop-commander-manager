@@ -11,9 +11,8 @@ src-tauri/resources/runtime/**
 !src-tauri/resources/runtime/.gitkeep
 src-tauri/resources/proxy/MCPStdioProxy.mjs
 # Never commit user-local connection data if debug/test runs move them here
-**/settings.json
-**/access-policy.json
-**/restart-request.txt
+**/connection.json
+**/backend-restart.request
 **/commander-manager.yaml
 **/profiles/
 **/state/

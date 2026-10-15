@@ -30,7 +30,7 @@ jobs:
       - name: Install frontend dependencies
         working-directory: manager
         run: npm install --no-audit --no-fund
-      - name: Verify proxy policy tests
+      - name: Verify MCP transport and vendor regression tests
         working-directory: manager
         run: npm run test:proxy
       - name: Verify Svelte types
@@ -39,7 +39,7 @@ jobs:
       - name: Check for accidentally bundled local credentials
         working-directory: manager
         run: npm run check:release
-      - name: Verify Rust command quoting
+      - name: Verify Rust command and connection settings tests
         working-directory: manager/src-tauri
         run: cargo test
       - name: Build bundled installer

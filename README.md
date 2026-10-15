@@ -9,13 +9,16 @@ Download the latest Windows `*-setup.exe` from [Releases](https://github.com/ino
 ## Features
 
 - Tauri 2 + Rust + Svelte 5 desktop tray app, compact fixed-size dark panel
-- Allowed-folder list with square scrollbar and selection-based removal
-- Live file-access policy in restricted mode; arbitrary shell/process tools disabled
+- Full Desktop Commander tool compatibility, including PowerShell and filesystem access
+- Direct transport supervision of the Desktop Commander backend without a separate policy proxy
 - Connect/disconnect tunnel and restart Desktop Commander backend
-- API key stored in Windows Credential Manager, never in tracked configuration
+- Scrollable in-app activity log for connection, restart, settings, and error events, with severity-colored entries
+- API key stored in Windows Credential Manager; passed only to the tunnel-client process environment at connection time
 - Vendor runtimes bundled in the Windows installer, with third-party license notices; end users do not install Node manually
 
-**Security boundary:** allowed folders restrict MCP file tools; this is not a Windows OS sandbox. Unrestricted mode grants file and shell access with the Windows account permissions. Existing in-flight actions may need interruption when access becomes more restrictive.
+**API key handling:** the runtime API key is not stored in source, JSON settings, tunnel profiles, or permanent Windows environment variables. When connecting, Manager reads it from Windows Credential Manager and sets `CONTROL_PLANE_API_KEY` only in the child `tunnel-client` environment. Its profile uses `env:CONTROL_PLANE_API_KEY`. The transport proxy removes that variable before spawning Desktop Commander, so normal PowerShell tool calls do not inherit it. A live tunnel process still holds the key in memory: use a runtime key limited to Tunnels **Read + Use**, never an Admin API key. Windows user-level command access is not a security sandbox.
+
+**Security boundary:** remote MCP commands run with the signed-in Windows user's file and process permissions. The manager does not provide a directory allowlist or OS sandbox. Only connect tunnels you control; disconnect when not in use. Restarting Desktop Commander interrupts in-flight work. Connection settings for this version are stored in per-user connection.json.
 
 ## Build
 

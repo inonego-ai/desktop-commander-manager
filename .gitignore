@@ -10,9 +10,8 @@
 **/credentials/
 **/profiles/
 **/state/
-**/settings.json
-**/access-policy.json
-**/restart-request.txt
+**/connection.json
+**/backend-restart.request
 **/commander-manager.yaml
 
 # Runtime/build artifacts
