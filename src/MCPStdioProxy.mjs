@@ -5,6 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { extensions } from './extensions/index.mjs';
 
 for (const name of ['CONTROL_PLANE_API_KEY', 'CONTROL_PLANE_TUNNEL_ID']) {
     delete process.env[name];
@@ -24,8 +25,7 @@ const FORWARD_PROTOCOL_LOGGING = /^(1|true|yes)$/i.test(process.env.MCP_PROXY_FO
 const UI_META_KEYS = new Set(['ui', 'ui/resourceUri', 'openai/outputTemplate', 'openai/widgetAccessible']);
 const UI_RESOURCE_PREFIX = 'ui://desktop-commander/';
 const UI_RESOURCE_UNAVAILABLE_ERROR_CODE = -32002;
-const STALE_UI_READ_TOOL_NAMES = new Set(['read_file', 'list_directory', 'get_config', 'track_ui_event']);
-const STALE_UI_MUTATION_TOOL_NAMES = new Set(['write_file', 'edit_block', 'set_config_value']);
+const UI_CAPABILITY_EXTENSIONS = ['io.modelcontextprotocol/ui', 'openai/form'];
 
 function envInt(name, fallback, minimum) {
     const value = Number.parseInt(process.env[name] ?? '', 10);
@@ -69,6 +69,17 @@ function initializeFingerprint(message) {
     })).digest('hex');
 }
 
+function normalizeInitializeRequest(message) {
+    if (FORWARD_UI_METADATA || message?.method !== 'initialize') return;
+    const extensions = message.params?.capabilities?.extensions;
+    if (!extensions || typeof extensions !== 'object') return;
+    // A client UI extension cannot change a backend session whose UI surface
+    // this proxy has disabled. Apply the same boundary before forwarding and
+    // before comparing cached initialization; preserve all other capabilities.
+    for (const name of UI_CAPABILITY_EXTENSIONS) delete extensions[name];
+    if (Object.keys(extensions).length === 0) delete message.params.capabilities.extensions;
+}
+
 function serialize(message) {
     return JSON.stringify(message);
 }
@@ -102,26 +113,26 @@ const proxyInstanceID = randomUUID();
 const PROXY_TOOLS = [
     {
         name: 'mcp_transport_status',
-        description: 'Show the local MCP stdio proxy state, backend generation, payload limit, and spool usage.',
+        description: '로컬 MCP 연결 상태, 실행 상태, 메시지 크기 제한 및 임시 보관 현황을 확인합니다.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        annotations: { title: 'MCP Transport Status', readOnlyHint: true }
+        annotations: { title: 'MCP 연결 상태', readOnlyHint: true }
     },
     {
         name: 'mcp_transport_list_spooled_responses',
-        description: 'List oversized MCP messages preserved by the local transport proxy.',
+        description: '크기 제한 때문에 임시 보관된 MCP 응답 목록을 확인합니다.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-        annotations: { title: 'List Preserved MCP Responses', readOnlyHint: true }
+        annotations: { title: '보관된 MCP 응답 목록', readOnlyHint: true }
     },
     {
         name: 'mcp_transport_read_spooled_response',
-        description: 'Read a bounded byte range from a preserved MCP response. Use base64 for exact byte reconstruction.',
+        description: '보관된 MCP 응답의 지정 범위를 읽습니다. 원본 바이트 복원에는 base64 인코딩을 사용하세요.',
         inputSchema: {
             type: 'object', properties: {
                 responseId: { type: 'string' }, offset: { type: 'integer', minimum: 0 },
                 length: { type: 'integer', minimum: 1, maximum: READ_CHUNK_MAX_BYTES },
                 encoding: { type: 'string', enum: ['utf8', 'base64'] }
             }, required: ['responseId'], additionalProperties: false
-        }, annotations: { title: 'Read Preserved MCP Response', readOnlyHint: true }
+        }, annotations: { title: '보관된 MCP 응답 읽기', readOnlyHint: true }
     }
 ];
 
@@ -153,7 +164,7 @@ class MCPStdioProxy {
         this.strippedUiMetadataFields = 0;
         this.filteredUiResources = 0;
         this.suppressedUiResourceReads = 0;
-        this.suppressedUiToolCalls = 0;
+        this.rejectedUiToolCalls = 0;
         this.restartToken = '';
         this.restartTimer = null;
     }
@@ -201,6 +212,7 @@ class MCPStdioProxy {
         const child = spawn(childCommand, childArgs, { stdio: ['pipe', 'pipe', 'pipe'], env: process.env, windowsHide: true });
         this.child = child;
         this.childReady = !replaySession;
+        this.log(`backend started pid=${child.pid} generation=${generation}`);
         child.stderr.on('data', chunk => process.stderr.write(chunk));
         const output = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
         output.on('line', line => {
@@ -252,8 +264,10 @@ class MCPStdioProxy {
         let message;
         try { message = JSON.parse(line); }
         catch { this.log('dropped invalid JSON from tunnel client'); return; }
-        if (await this.handleLocalToolCall(message)) return;
+        normalizeInitializeRequest(message);
         if (await this.handleDisabledUiRequest(message)) return;
+        if (await extensions.intercept(message, serialized => this.writeParent(serialized))) return;
+        if (await this.handleLocalToolCall(message)) return;
 
         if (message?.method === 'initialize' && isRequest(message) && this.initializeResponseTemplate) {
             const fingerprint = initializeFingerprint(message);
@@ -268,11 +282,22 @@ class MCPStdioProxy {
                 await this.writeParent(serialize(this.backendError(message.id, 'Initialize parameters changed while requests are still active.')));
                 return;
             }
+            const previous = this.initializeTemplate?.params ?? {};
+            const current = message.params ?? {};
+            const changed = ['protocolVersion', 'capabilities', 'clientInfo'].flatMap(key => {
+                if (stableJson(previous[key]) === stableJson(current[key])) return [];
+                if (key === 'protocolVersion') return [key];
+                return [...new Set([...Object.keys(previous[key] ?? {}), ...Object.keys(current[key] ?? {})])]
+                    .filter(field => stableJson(previous[key]?.[field]) !== stableJson(current[key]?.[field]))
+                    .map(field => `${key}.${field}`);
+            });
+            this.log(`initialize changed fields=${changed.join(',')}`);
             await this.resetSessionForInitialize();
         }
 
         await this.ensureChildReady();
         if (message?.method === 'initialize' && isRequest(message)) {
+            this.log(`initialize forwarded generation=${this.childGeneration}`);
             this.initializeTemplate = structuredClone(message);
             this.initializeFingerprint = initializeFingerprint(message);
         }
@@ -365,6 +390,7 @@ class MCPStdioProxy {
         if (entry) {
             this.removePending(entry);
             if (entry.method === 'initialize') {
+                this.log(`initialize response generation=${this.childGeneration} success=${!message.error}`);
                 this.initializeCompleted = !message.error;
                 if (this.initializeCompleted) {
                     this.normalizeInitializeResponse(message);
@@ -393,7 +419,7 @@ class MCPStdioProxy {
             for (const tool of tools) this.stripUiMetadata(tool);
         }
         const names = new Set(tools.map(tool => tool?.name));
-        for (const tool of PROXY_TOOLS) if (!names.has(tool.name)) tools.push(tool);
+        for (const tool of [...PROXY_TOOLS, ...extensions.tools]) if (!names.has(tool.name)) tools.push(tool);
     }
 
     stripUiMetadata(tool) {
@@ -443,28 +469,12 @@ class MCPStdioProxy {
             return true;
         }
         if (message.method === 'tools/call' && message.params?.arguments?.origin === 'ui') {
-            const toolName = message.params?.name;
-            if (STALE_UI_READ_TOOL_NAMES.has(toolName)) {
-                this.suppressedUiToolCalls += 1;
-                await this.writeParent(serialize({
-                    jsonrpc: '2.0',
-                    id: message.id,
-                    result: { content: [] }
-                }));
-                return true;
-            }
-            if (STALE_UI_MUTATION_TOOL_NAMES.has(toolName)) {
-                this.suppressedUiToolCalls += 1;
-                await this.writeParent(serialize({
-                    jsonrpc: '2.0',
-                    id: message.id,
-                    result: {
-                        content: [{ type: 'text', text: 'The cached Desktop Commander UI is disabled by the transport proxy. Use the normal agent tool call instead.' }],
-                        isError: true
-                    }
-                }));
-                return true;
-            }
+            this.rejectedUiToolCalls += 1;
+            await this.writeParent(serialize({
+                jsonrpc: '2.0', id: message.id,
+                error: { code: -32602, message: '이 연결은 위젯에서 직접 보내는 도구 요청을 지원하지 않습니다.' }
+            }));
+            return true;
         }
         return false;
     }
@@ -608,7 +618,7 @@ class MCPStdioProxy {
             strippedUiMetadataFields: this.strippedUiMetadataFields,
             filteredUiResources: this.filteredUiResources,
             suppressedUiResourceReads: this.suppressedUiResourceReads,
-            suppressedUiToolCalls: this.suppressedUiToolCalls,
+            rejectedUiToolCalls: this.rejectedUiToolCalls,
             maxMessageBytes: MAX_MESSAGE_BYTES, spoolMaxAgeMs: SPOOL_MAX_AGE_MS,
             preservedResponses: spool.length,
             preservedBytes: spool.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0)
@@ -716,7 +726,7 @@ class MCPStdioProxy {
             this.childReady = false;
         }
         if (this.shuttingDown || this.expectedExit === child) return;
-        this.log(`backend exited code=${code} signal=${signal ?? ''}`);
+        this.log(`backend exited pid=${child.pid} generation=${this.childGeneration} code=${code} signal=${signal ?? ''}`);
         try { await this.restartChild('backend process exited'); }
         catch (error) { this.log(`backend restart failed: ${error}`); }
     }

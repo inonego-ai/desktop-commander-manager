@@ -3,12 +3,14 @@ import readline from 'node:readline';
 
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const send = message => process.stdout.write(`${JSON.stringify(message)}\n`);
+let initializeParams;
 
 input.on('line', line => {
     const message = JSON.parse(line);
     const { id, method, params } = message;
 
     if (method === 'initialize') {
+        initializeParams = params;
         return send({
             jsonrpc: '2.0', id,
             result: {
@@ -72,6 +74,9 @@ input.on('line', line => {
     if (method !== 'tools/call') return;
 
     const name = params?.name;
+    if (name === 'initialize_parameters') {
+        return send({ jsonrpc: '2.0', id, result: { content: [{type:'text', text:JSON.stringify(initializeParams)}] } });
+    }
     if (name === 'oversize') {
         return send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: 'x'.repeat(100000) }] } });
     }

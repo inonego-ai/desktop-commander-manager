@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Desktop Commander Manager",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "ai.inonego.commander-manager",
   "build": {
     "beforeDevCommand": "npm run dev:ui",
@@ -14,13 +14,13 @@
       {
         "label": "main",
         "title": "Desktop Commander Manager",
-        "width": 420,
-        "height": 400,
-        "minWidth": 420,
-        "maxWidth": 420,
-        "minHeight": 400,
-        "maxHeight": 400,
-        "resizable": false,
+        "width": 820,
+        "height": 460,
+        "minWidth": 720,
+        "maxWidth": 1200,
+        "minHeight": 430,
+        "maxHeight": 800,
+        "resizable": true,
         "center": true,
         "backgroundColor": "#15191f"
       }

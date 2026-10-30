@@ -1,13 +1,13 @@
 {
   "name": "commander-manager",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "dev": "tauri dev",
-    "build": "tauri build",
+    "build": "npm run check:release && tauri build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "test:proxy": "node --test tests/*.test.mjs ../tests/MCPStdioProxy.test.mjs",
+    "test:proxy": "node --test tests/*.test.mjs ../tests/*.test.mjs",
     "dev:ui": "vite --host 127.0.0.1",
     "build:ui": "vite build",
     "check:release": "node scripts/Check-Release.mjs"
