@@ -89,7 +89,7 @@ impl CommanderState {
         let missing: Vec<_> = [tunnel, node, dc, transport].into_iter()
             .filter(|p| !p.is_file()).map(|p| p.display().to_string()).collect();
         if missing.is_empty() { Ok(()) }
-        else { Err(format!("Release runtime is incomplete ({} missing file(s)). Run scripts/Prepare-Release.ps1 before building.", missing.len())) }
+        else { Err(format!("실행 리소스가 누락됐습니다({}개). 배포 리소스를 준비한 뒤 다시 빌드해 주세요.", missing.len())) }
     }
 
     // Health check is strictly bound to a local ephemeral loopback address.
@@ -124,16 +124,22 @@ impl CommanderState {
     fn stop(&self) -> Result<(), String> {
         let mut managed = self.process.lock().map_err(|e| e.to_string())?;
         let Some(child) = managed.as_mut() else { return Ok(()); };
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            *managed = None;
+            return Ok(());
+        }
         // Only the process tree this manager created may be stopped. Never
         // terminate all node.exe or tunnel-client.exe processes on the PC.
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
             let status = Command::new("taskkill.exe")
                 .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                .creation_flags(0x08000000)
                 .stdout(Stdio::null()).stderr(Stdio::null())
-                .status().map_err(|e| format!("Cannot stop managed tunnel tree: {e}"))?;
-            if !status.success() {
-                return Err("Stopping the managed tunnel process tree failed. It is still tracked; check its status before retrying.".into());
+                .status().map_err(|e| format!("관리 중인 터널을 종료하지 못했습니다: {e}"))?;
+            if !status.success() && child.try_wait().map_err(|e| e.to_string())?.is_none() {
+                return Err("관리 중인 터널 종료에 실패했습니다. 실행 상태를 확인한 뒤 다시 시도해 주세요.".into());
             }
         }
         #[cfg(not(target_os = "windows"))]
@@ -159,13 +165,13 @@ fn recent_connection_issue(path: &Path, baseline: u64) -> Option<String> {
 
 fn classify_connection_log(log: &str) -> Option<&'static str> {
     if log.contains("tunnel_active_organization_required") {
-        Some("This tunnel requires an organization context. Enter the OpenAI Organization ID (org-...) in Connection settings.")
+        Some("조직 정보가 필요한 터널입니다. 연결 설정에서 OpenAI 조직 ID(org-...)를 입력해 주세요.")
     } else if log.contains("Unauthorized") || log.contains("status 401") {
-        Some("Tunnel authentication failed (401). Check the API key and Tunnel ID in Connection settings.")
+        Some("터널 인증에 실패했습니다(401). 연결 설정의 API 키와 터널 ID를 확인해 주세요.")
     } else if log.contains("status 403") || log.contains("Forbidden") {
-        Some("Tunnel access denied (403). Check API key permissions for this Tunnel ID.")
+        Some("터널 접근이 거부됐습니다(403). 해당 터널에 대한 API 키 권한을 확인해 주세요.")
     } else if log.contains("OnStart hook failed") || log.contains("start stdio command") {
-        Some("Could not start the bundled MCP backend. Check the installed runtime.")
+        Some("MCP 백엔드를 시작하지 못했습니다. 설치된 실행 리소스를 확인해 주세요.")
     } else { None }
 }
 
@@ -181,7 +187,7 @@ fn secret_is_set() -> bool {
 fn validate_organization_id(value: &str) -> Result<(), String> {
     if !value.is_empty() && (!value.starts_with("org-") || value.len() > 128
         || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
-        return Err("Invalid Organization ID. Expected org-... or leave blank for the default account context.".into());
+        return Err("조직 ID가 올바르지 않습니다. org-... 형식을 입력하거나 기본 계정을 사용하려면 비워 두세요.".into());
     }
     Ok(())
 }
@@ -189,7 +195,7 @@ fn validate_organization_id(value: &str) -> Result<(), String> {
 fn validate_tunnel_id(value: &str) -> Result<(), String> {
     if value.len() != 39 || !value.starts_with("tunnel_")
         || !value[7..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
-        return Err("Invalid Tunnel ID. Expected tunnel_ followed by 32 lowercase letters or digits.".into());
+        return Err("터널 ID가 올바르지 않습니다. tunnel_ 뒤에 영문 소문자 또는 숫자 32자가 필요합니다.".into());
     }
     Ok(())
 }
@@ -216,9 +222,9 @@ fn save_connection(manager: State<'_, CommanderState>, tunnel_id: String, organi
     let id = tunnel_id.trim();
     validate_tunnel_id(id)?;
     validate_organization_id(organization_id.trim())?;
-    if manager.is_running()? { return Err("Disconnect the tunnel before changing credentials.".into()); }
+    if manager.is_running()? { return Err("인증 정보를 바꾸기 전에 터널 연결을 해제해 주세요.".into()); }
     if !api_key.is_empty() && (api_key.trim().is_empty() || (api_key.contains('\r') || api_key.contains('\n'))) {
-        return Err("API key must be nonblank and single-line.".into());
+        return Err("API 키는 빈칸이나 줄바꿈 없이 입력해 주세요.".into());
     }
     let mut config = manager.config.lock().map_err(|e| e.to_string())?;
     let mut proposed = config.clone();
@@ -227,7 +233,7 @@ fn save_connection(manager: State<'_, CommanderState>, tunnel_id: String, organi
     // Do not expose credential bytes in any settings or policy file.
     manager.save_config(&proposed)?;
     if !api_key.is_empty() {
-        secret_entry()?.set_password(&api_key).map_err(|e| format!("Credential Manager error: {e}"))?;
+        secret_entry()?.set_password(&api_key).map_err(|e| format!("Windows 자격 증명 관리자 오류: {e}"))?;
     }
     *config = proposed;
     *manager.log_start.lock().map_err(|e| e.to_string())? = None;
@@ -253,8 +259,8 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
     let config = manager.config.lock().map_err(|e| e.to_string())?.clone();
     validate_tunnel_id(&config.tunnel_id)?;
     validate_organization_id(&config.organization_id)?;
-    let api_key = secret_entry()?.get_password().map_err(|_| "No stored API key. Open Connection settings.".to_string())?;
-    if api_key.trim().is_empty() { return Err("No stored API key.".into()); }
+    let api_key = secret_entry()?.get_password().map_err(|_| "저장된 API 키가 없습니다. 연결 설정을 열어 주세요.".to_string())?;
+    if api_key.trim().is_empty() { return Err("저장된 API 키가 없습니다.".into()); }
     let (tunnel, node, dc, transport) = manager.runtime_files();
     let profile_dir = manager.data_dir.join("profiles");
     let logs = manager.data_dir.join("logs");
@@ -280,6 +286,10 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
     }
     fs::write(profile_dir.join("commander-manager.yaml"),
         serde_json::to_vec_pretty(&profile).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    // Keep backend exceptions locally; tunnel.log contains dispatcher events,
+    // while the stdio proxy and its Node child report failures on stderr.
+    let backend_log = fs::OpenOptions::new().create(true).append(true)
+        .open(logs.join("backend.stderr.log")).map_err(|e| e.to_string())?;
     let mut child = Command::new(tunnel);
     // Always name the exact manager-owned profile. Supplying a directory alone
     // does not select a profile in tunnel-client.
@@ -289,17 +299,18 @@ fn connect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
         .env("MCP_STDIO_SEND_INITIALIZED_NOTIFICATION", "1")
         .env("MCP_BACKEND_RESTART_TRIGGER", manager.restart_trigger())
         .env("MCP_PROXY_SPOOL_DIR", spool)
-        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(backend_log);
     #[cfg(target_os = "windows")]
     { use std::os::windows::process::CommandExt; child.creation_flags(0x08000000); }
     // Inspect only messages created by this connection attempt, never stale errors.
     let log_length = fs::metadata(manager.tunnel_log()).map(|m| m.len()).unwrap_or(0);
     *manager.log_start.lock().map_err(|e| e.to_string())? = Some(log_length);
-    let process = child.spawn().map_err(|e| format!("Could not start tunnel-client: {e}"))?;
+    let process = child.spawn().map_err(|e| format!("터널 실행기를 시작하지 못했습니다: {e}"))?;
     *manager.process.lock().map_err(|e| e.to_string())? = Some(process);
     std::thread::sleep(Duration::from_millis(450));
     if !manager.is_running()? {
-        return Err(manager.connection_issue().unwrap_or_else(|| "Tunnel client exited during startup. Check the runtime installation.".into()));
+        return Err(manager.connection_issue().unwrap_or_else(|| "터널 실행기가 시작 중 종료됐습니다. 실행 리소스 설치 상태를 확인해 주세요.".into()));
     }
     Ok(())
 }
@@ -313,7 +324,7 @@ fn disconnect_tunnel(manager: State<'_, CommanderState>) -> Result<(), String> {
 
 #[tauri::command]
 fn restart_dc(manager: State<'_, CommanderState>) -> Result<(), String> {
-    if !manager.is_running()? { return Err("Tunnel is not running.".into()); }
+    if !manager.is_running()? { return Err("터널이 실행 중이 아닙니다.".into()); }
     manager.signal_restart()
 }
 
@@ -354,10 +365,10 @@ mod tests {
 
     #[test]
     fn reports_only_safe_connection_diagnostics() {
-        assert!(super::classify_connection_log("poll failed: 401 Unauthorized").unwrap().contains("authentication"));
-        assert!(super::classify_connection_log("OnStart hook failed: raw username path").unwrap().contains("MCP backend"));
+        assert!(super::classify_connection_log("poll failed: 401 Unauthorized").unwrap().contains("인증"));
+        assert!(super::classify_connection_log("OnStart hook failed: raw username path").unwrap().contains("MCP 백엔드"));
         assert!(super::classify_connection_log("request body: secret-example").is_none());
-        assert!(super::classify_connection_log("401: tunnel_active_organization_required").unwrap().contains("Organization ID"));
+        assert!(super::classify_connection_log("401: tunnel_active_organization_required").unwrap().contains("조직 ID"));
     }
 
     #[test]
@@ -386,7 +397,7 @@ mod tests {
         std::fs::write(&file, format!("{startup}\n401: tunnel_active_organization_required\n")).unwrap();
         let issue = super::recent_connection_issue(&file, 0);
         let _ = std::fs::remove_file(&file);
-        assert!(issue.unwrap().contains("Organization ID"));
+        assert!(issue.unwrap().contains("조직 ID"));
     }
 }
 
@@ -394,22 +405,27 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let directory = app.path().app_local_data_dir()?;
+            // Debug smoke tests must never touch the installed Manager profile.
+            #[cfg(debug_assertions)]
+            let directory = std::env::var_os("COMMANDER_MANAGER_TEST_DATA_DIR")
+                .map(PathBuf::from).unwrap_or(directory);
             fs::create_dir_all(&directory)?;
             let settings_path = directory.join("connection.json");
             let settings = if settings_path.is_file() {
                 serde_json::from_slice::<Settings>(&fs::read(&settings_path)?)?
             } else { Settings::default() };
+            let resources = app.path().resource_dir()?;
             let manager = CommanderState {
                 config: Mutex::new(settings.clone()),
                 process: Mutex::new(None),
                 data_dir: directory,
-                resource_dir: app.path().resource_dir()?,
+                resource_dir: resources,
                 log_start: Mutex::new(None),
             };
             manager.save_config(&settings)?;
             app.manage(manager);
-            let open = MenuItem::with_id(app, "show", "Open manager", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "show", "연결 관리자 열기", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "종료", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().ok_or_else(|| std::io::Error::other("Missing app icon"))?.clone())
@@ -436,13 +452,14 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if window.label() == "main" { let _ = window.hide(); }
             }
         })
         .invoke_handler(tauri::generate_handler![
             get_status, save_connection, connect_tunnel, disconnect_tunnel,
             restart_dc, exit_manager
         ])
-        .run(tauri::generate_context!())
-        .expect("Error running Desktop Commander Manager");
+        .build(tauri::generate_context!())
+        .expect("Error running Desktop Commander Manager")
+        .run(|_, _| {});
 }

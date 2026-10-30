@@ -10,6 +10,7 @@ src-tauri/gen/
 src-tauri/resources/runtime/**
 !src-tauri/resources/runtime/.gitkeep
 src-tauri/resources/proxy/MCPStdioProxy.mjs
+src-tauri/resources/proxy/extensions/
 # Never commit user-local connection data if debug/test runs move them here
 **/connection.json
 **/backend-restart.request

@@ -34,6 +34,17 @@ try {
         throw "MCPStdioProxy.mjs not found at $TransportProxySource. Keep manager/ beside src/ in this repository or supply -TransportProxySource."
     }
     Copy-Item -LiteralPath $TransportProxySource -Destination (Join-Path $proxy 'MCPStdioProxy.mjs') -Force
+    $extensionSource = Join-Path (Split-Path -Parent $TransportProxySource) 'extensions'
+    $extensionTarget = Join-Path $proxy 'extensions'
+    New-Item -ItemType Directory -Path $extensionTarget -Force | Out-Null
+    # Only explicitly registered extensions are shipped. Retired Goal/Plan modules stay out.
+    foreach ($module in @('index.mjs', 'registry.mjs')) {
+        $source = Join-Path $extensionSource $module
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "Required MCP extension registry module is missing: $module"
+        }
+        Copy-Item -LiteralPath $source -Destination (Join-Path $extensionTarget $module) -Force
+    }
 
     $tunnelArchive = "tunnel-client-v$TunnelClientVersion-windows-amd64.zip"
     $tunnelBase = "https://github.com/openai/tunnel-client/releases/download/v$TunnelClientVersion"

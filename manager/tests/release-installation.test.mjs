@@ -1,0 +1,30 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { verifyInstallation } from '../scripts/Verify-Installation.mjs';
+
+test('installation inventory rejects undeclared extension backups even when every current resource matches', async t => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(),'manager-install-test-'));
+  t.after(()=>fs.rm(temp,{recursive:true,force:true}));
+  const resources=path.join(temp,'resources'), installed=path.join(temp,'installed');
+  await fs.mkdir(path.join(resources,'proxy'),{recursive:true});
+  await fs.mkdir(path.join(installed,'proxy'),{recursive:true});
+  await fs.writeFile(path.join(resources,'proxy/current.mjs'),'current');
+  await fs.writeFile(path.join(installed,'proxy/current.mjs'),'current');
+  const executable=path.join(temp,'built.exe');
+  await fs.writeFile(executable,'header__TAURI_BUNDLE_TYPE_VAR_UNKbody');
+  await fs.writeFile(path.join(installed,'commander-manager.exe'),'header__TAURI_BUNDLE_TYPE_VAR_NSSbody');
+  await fs.writeFile(path.join(installed,'uninstall.exe'),'uninstaller');
+  const options={resources,executable,installed};
+  assert.equal((await verifyInstallation(options)).passed,true);
+  await fs.writeFile(path.join(installed,'proxy/retired.mjs.bak'),'retired');
+  const retired=await verifyInstallation(options);
+  assert.equal(retired.passed,false);
+  assert.deepEqual(retired.unexpected,['proxy/retired.mjs.bak']);
+  assert.deepEqual(retired.mismatched,[]);
+  await fs.writeFile(path.join(installed,'proxy/current.mjs'),'modified');
+  const modified=await verifyInstallation(options);
+  assert.deepEqual(modified.mismatched,['proxy/current.mjs']);
+});

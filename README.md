@@ -1,6 +1,6 @@
 # Desktop Commander Manager
 
-Compact, dark-mode Windows application for managing a personal Desktop Commander MCP tunnel.
+개인 Desktop Commander MCP 터널과 로컬 확장 기능을 관리하는 Windows 앱입니다.
 
 ## Install
 
@@ -8,9 +8,11 @@ Download the latest Windows `*-setup.exe` from [Releases](https://github.com/ino
 
 ## Features
 
-- Tauri 2 + Rust + Svelte 5 desktop tray app, compact fixed-size dark panel
+- Tauri 2 + Rust + Svelte 5 기반 트레이 앱과 크기 조절 가능한 Manager 창
 - Full Desktop Commander tool compatibility, including PowerShell and filesystem access
-- Direct transport supervision of the Desktop Commander backend without a separate policy proxy
+- MCP 프록시가 Desktop Commander 백엔드와 초기화 세션을 직접 관리
+- Goal/Plan 전용 기능 없이 향후 MCP 도구를 명시적으로 등록할 수 있는 확장 레지스트리
+- 확장 기능 영역을 유지하는 Manager GUI (현재 기본 확장 0개)
 - Connect/disconnect tunnel and restart Desktop Commander backend
 - Scrollable in-app activity log for connection, restart, settings, and error events, with severity-colored entries
 - API key stored in Windows Credential Manager; passed only to the tunnel-client process environment at connection time

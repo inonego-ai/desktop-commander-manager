@@ -65,6 +65,47 @@ async function initialize(client) {
     client.notify('notifications/initialized');
 }
 
+test('disabled UI capability changes reuse one backend while real capability changes renegotiate', async () => {
+    const spool = await mkdtemp(path.join(os.tmpdir(), 'mcp-ui-capabilities-'));
+    const marker = path.join(spool, 'restart.request');
+    await writeFile(marker, 'initial');
+    const client = createClient(spool, marker);
+    const core = {protocolVersion:'2025-06-18', clientInfo:{name:'proxy-test',version:'1.0.0'}};
+    const state = async id => JSON.parse((await client.request(id, 'tools/call', {
+        name:'mcp_transport_status', arguments:{}
+    })).result.content[0].text);
+    const received = async id => JSON.parse((await client.request(id, 'tools/call', {
+        name:'initialize_parameters', arguments:{}
+    })).result.content[0].text);
+    try {
+        await client.request('first', 'initialize', {...core, capabilities:{extensions:{
+            'io.modelcontextprotocol/ui':{mimeTypes:['text/html']}, 'openai/form':{}
+        }}});
+        client.notify('notifications/initialized');
+        assert.deepEqual((await received('first-received')).capabilities, {});
+        const initial = await state('initial-state');
+        for (const [i, extensions] of [undefined, {}, {'io.modelcontextprotocol/ui':{}}, {'openai/form':{}}].entries()) {
+            const response = await client.request('ui-' + i, 'initialize', {...core,
+                capabilities:extensions === undefined ? {} : {extensions}});
+            assert.ok(response.result);
+            client.notify('notifications/initialized');
+            const current = await state('state-' + i);
+            assert.equal(current.backendPid, initial.backendPid);
+            assert.equal(current.backendGeneration, initial.backendGeneration);
+            assert.equal(current.cachedInitializeResponses, i + 1);
+        }
+        const capabilities = {roots:{listChanged:true}, extensions:{'example/non-ui':{enabled:true}}};
+        const changed = await client.request('real-change', 'initialize', {...core, capabilities});
+        assert.ok(changed.result);
+        client.notify('notifications/initialized');
+        assert.equal((await state('changed-state')).backendGeneration, initial.backendGeneration + 1);
+        assert.deepEqual((await received('changed-received')).capabilities, capabilities);
+    } finally {
+        client.child.kill('SIGTERM');
+        await rm(spool, {recursive:true, force:true});
+    }
+});
+
 test('proxy owns transport, UI, secret, and backend lifecycle boundaries', async () => {
     const spool = await mkdtemp(path.join(os.tmpdir(), 'mcp-proxy-test-'));
     const restartMarker = path.join(spool, 'backend-restart.request');
@@ -93,6 +134,8 @@ test('proxy owns transport, UI, secret, and backend lifecycle boundaries', async
         const tools = await client.request('tools', 'tools/list');
         const names = tools.result.tools.map(tool => tool.name);
         assert(names.includes('mcp_transport_status'));
+        assert(!names.some(name => name.startsWith('plan_') || name.startsWith('task_')));
+        assert(names.includes('mock'));
         assert.equal(tools.result.tools.find(tool => tool.name === 'mock')._meta, undefined);
 
         const resources = await client.request('resources', 'resources/list');
@@ -105,6 +148,16 @@ test('proxy owns transport, UI, secret, and backend lifecycle boundaries', async
         assert.equal(disabledUi.error.data.reason, 'ui_disabled');
         const nonUi = await client.request('non-ui', 'resources/read', { uri: 'file://mock/data' });
         assert.match(nonUi.result.contents[0].text, /mock widget/);
+
+        for (const name of ['read_file', 'write_file', 'mock', 'environment', 'mcp_transport_status']) {
+            const unsupported = await client.request('ui-origin-' + name, 'tools/call', {
+                name, arguments: { origin: 'ui' }
+            });
+            assert.equal(unsupported.error.code, -32602,
+                'unsupported widget calls must fail explicitly for every tool');
+        }
+        const afterUiCalls = await transportState('after-ui-origin');
+        assert.equal(afterUiCalls.rejectedUiToolCalls, 5);
 
         const environment = await client.request('env', 'tools/call', { name: 'environment', arguments: {} });
         const environmentData = JSON.parse(environment.result.content[0].text);
